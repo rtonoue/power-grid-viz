@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>発電実績 × HJKS 可視化（プロトタイプ）</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <h1>発電実績 × HJKS 可視化</h1>
+      <span class="sub">プロトタイプ / モックデータ</span>
+      <span id="mode-badge">—</span>
+    </header>
+
+    <div id="main">
+      <div id="map">
+        <div id="legend"></div>
+      </div>
+
+      <aside id="panel">
+        <!-- 期間 -->
+        <section>
+          <div class="sec-title">期間と粒度</div>
+          <div class="period-row">
+            <label>開始<input type="date" id="p-from"></label>
+            <label>終了<input type="date" id="p-to"></label>
+            <label>粒度
+              <select id="p-gran">
+                <option value="hour">時</option>
+                <option value="day">日</option>
+                <option value="month">月</option>
+              </select>
+            </label>
+          </div>
+          <div class="presets">
+            <button data-preset="24h">24時間</button>
+            <button data-preset="7d">7日</button>
+            <button data-preset="30d">30日</button>
+            <button data-preset="12m">12か月</button>
+          </div>
+        </section>
+
+        <!-- 選択中の発電所/号機 -->
+        <section>
+          <div class="sec-title">選択中の発電所 <span class="pill">クリックで選択</span></div>
+          <div id="sel-empty" class="muted">地図上の発電所マーカー、または下のHJKSリストをクリックすると、供給可能量と発電実績を表示します。</div>
+          <div id="sel-body" style="display:none">
+            <div style="font-weight:700; font-size:14px" id="sel-title"></div>
+            <div class="muted" id="sel-meta" style="margin-bottom:6px"></div>
+            <select id="unit-select" class="full"></select>
+            <div class="chart-wrap"><canvas id="chart-plant"></canvas></div>
+            <div id="sel-kpi"></div>
+          </div>
+        </section>
+
+        <!-- グループ集計 -->
+        <section>
+          <div class="sec-title">グループ集計</div>
+          <select id="group-select" class="full"></select>
+          <div id="grp-body" style="display:none">
+            <div class="chart-wrap"><canvas id="chart-group"></canvas></div>
+            <div id="grp-kpi"></div>
+          </div>
+        </section>
+
+        <!-- HJKS -->
+        <section>
+          <div class="sec-title">HJKS 停止・出力低下（現在） <span class="pill"><span id="hjks-count">0</span> 件</span></div>
+          <div id="hjks-list"></div>
+        </section>
+      </aside>
+    </div>
+  </div>
+
+  <script src="data.js"></script>
+  <script src="sim.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
