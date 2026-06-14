@@ -1,8 +1,10 @@
 /* =============================================================================
  * app.js — 画面ロジック（Leaflet 地図 + Chart.js グラフ + パネル）
+ *  データソース: hjks_data.js（HJKS実データ）+ sim.js（実績の合成）
  * ========================================================================== */
 
 const ZOOM_THRESHOLD = 7; // これ以上で発電所表示、未満でエリア集約表示
+const HJKS_LIST_MAX = 200; // HJKSパネルの最大表示件数
 
 const STATUS_STYLE = {
   '通常':     { ring: '#ffffff', weight: 1 },
@@ -10,7 +12,6 @@ const STATUS_STYLE = {
   '停止':     { ring: '#e53935', weight: 3 },
 };
 
-// 画面状態
 const state = {
   selectedPlantId: null,
   selectedUnitUid: 'ALL',
@@ -19,12 +20,16 @@ const state = {
 };
 
 let map, plantLayer, areaLayer, linesLayer;
-let plantMarkers = {};       // plantId -> marker
-let plantChart, groupChart;  // Chart.js インスタンス
+let plantMarkers = {};
+let plantStatusCache = {};   // plantId -> currentStatusOfPlant() 結果
+let plantChart, groupChart;
 
 document.addEventListener('DOMContentLoaded', init);
 
 function init() {
+  // 現在ステータスは初期化時に1回だけ計算してキャッシュ（速度優先）
+  for (const p of PLANTS) plantStatusCache[p.id] = currentStatusOfPlant(p);
+
   buildMap();
   buildPanelControls();
   buildGroupSelect();
@@ -38,12 +43,13 @@ function init() {
  * 地図
  * ------------------------------------------------------------------------- */
 function buildMap() {
-  map = L.map('map', { zoomControl: true, minZoom: 4, maxZoom: 12 })
+  // preferCanvas: マーカーをCanvas描画にして大量マーカーでも軽快に
+  map = L.map('map', { zoomControl: true, minZoom: 4, maxZoom: 12, preferCanvas: true })
     .setView([37.6, 137.8], 5);
 
-  // 国土地理院 淡色地図（APIキー不要）
   L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png', {
-    attribution: "地図: <a href='https://maps.gsi.go.jp/development/ichiran.html'>国土地理院</a>",
+    attribution: "地図: <a href='https://maps.gsi.go.jp/development/ichiran.html'>国土地理院</a>"
+      + "｜停止情報: <a href='https://hjks.jepx.or.jp/hjks/'>JEPX 発電情報公開システム</a>",
     maxZoom: 12,
   }).addTo(map);
 
@@ -57,23 +63,30 @@ function buildMap() {
   map.on('zoomend', () => { updateLayersForZoom(); updateModeBadge(); });
 }
 
-// 発電所マーカー（燃料色＋ステータスリング、ホバーでスペック表示）
 function buildPlantMarkers() {
   for (const p of PLANTS) {
-    const st = currentStatusOfPlant(p);
+    const vis = visiblePlantUnits(p);
+    if (vis.length === 0) continue;   // 全ユニット非表示（完全廃止等）の発電所は地図に出さない
+    const st = plantStatusCache[p.id];
     const style = STATUS_STYLE[st.status];
-    const totalCap = p.units.reduce((s, u) => s + u.capMW, 0);
+    // 軸別サブユニットは系列に含まれるため認可出力合計から除外（二重計上防止）
+    const totalCap = vis.reduce((s, u) => s + u.capMW, 0);
 
     const m = L.circleMarker([p.lat, p.lon], {
-      radius: 6 + Math.sqrt(totalCap) * 0.10,
-      fillColor: FUEL[p.fuel].color,
+      radius: 5 + Math.sqrt(totalCap) * 0.10,
+      fillColor: (FUEL[p.fuel] || FUEL['その他']).color,
       color: style.ring,
       weight: style.weight,
       fillOpacity: 0.9,
     });
 
-    m.bindTooltip(plantTooltipHtml(p, st, totalCap), {
-      direction: 'top', offset: [0, -4], className: 'plant-tip', sticky: true,
+    // ツールチップは初ホバー時に生成（起動時間を短縮）
+    m.on('mouseover', function () {
+      if (!this.getTooltip()) {
+        this.bindTooltip(plantTooltipHtml(p, st, totalCap), {
+          direction: 'top', offset: [0, -4], className: 'plant-tip', sticky: true,
+        }).openTooltip();
+      }
     });
     m.on('click', () => selectPlant(p.id));
     m.addTo(plantLayer);
@@ -82,40 +95,58 @@ function buildPlantMarkers() {
 }
 
 function plantTooltipHtml(p, st, totalCap) {
-  const curGen = p.units.reduce((s, u) => s + unitOutput(`${p.id}/${u.name}`, NOW), 0);
-  const curAv = p.units.reduce((s, u) => s + unitAvailability(`${p.id}/${u.name}`, NOW).capMW, 0);
+  const units = visiblePlantUnits(p);   // 軸別サブユニットは除外
+  let curGen = 0, curAv = 0;
+  for (const u of units) {
+    const o = unitOutput(u.uid, NOW);
+    if (o !== null) curGen += o;   // 非公開・廃止ユニットは実績に計上しない
+    curAv += unitAvailability(u.uid, NOW).capMW;
+  }
   const badge = st.status === '通常' ? ''
     : `<span class="tip-badge ${st.status === '停止' ? 'b-stop' : 'b-derate'}">${st.status}</span>`;
-  const unitRows = p.units.map((u) => {
-    const av = unitAvailability(`${p.id}/${u.name}`, NOW);
-    const tag = av.status === '通常' ? '' : ` <span class="u-${av.status === '停止' ? 'stop' : 'derate'}">${av.status}</span>`;
-    return `<div class="tip-unit"><span>${u.name}</span><span>${u.capMW.toLocaleString()} MW${tag}</span></div>`;
-  }).join('');
+
+  const MAXROW = 8;
+  const unitRows = units.slice(0, MAXROW).map((u) => {
+    const av = unitAvailability(u.uid, NOW);
+    const statusTag = av.status === '通常' ? ''
+      : ` <span class="u-${av.status === '停止' ? 'stop' : 'derate'}">${av.status}</span>`;
+    const b = unitBadge(u.uid);
+    const badgeTag = b ? ` <span class="${b === '要確認' ? 'u-review' : 'u-private'}">${b}</span>` : '';
+    return `<div class="tip-unit"><span>${esc(u.name)}</span><span>${u.capMW.toLocaleString()} MW${statusTag}${badgeTag}</span></div>`;
+  }).join('')
+    + (units.length > MAXROW ? `<div class="tip-unit muted">… 他 ${units.length - MAXROW} ユニット</div>` : '');
+
+  const cnt = (label) => units.filter((u) => unitBadge(u.uid) === label).length;
+  const notes = [];
+  if (cnt('非公開') > 0) notes.push(`非公開${cnt('非公開')}`);
+  if (cnt('廃止') > 0) notes.push(`廃止${cnt('廃止')}`);
+  if (cnt('要確認') > 0) notes.push(`要確認${cnt('要確認')}`);
+  const genNote = notes.length
+    ? `OCCTO実データ <span class="u-private">(${notes.join('・')})</span>` : 'OCCTO実データ';
+
   return `
     <div class="tip">
-      <div class="tip-head"><b>${p.name}</b> ${badge}</div>
-      <div class="tip-sub">${p.op}・${p.fuel}・${p.area}エリア</div>
+      <div class="tip-head"><b>${esc(p.name)}</b> ${badge}</div>
+      <div class="tip-sub">${esc(p.op)}・${p.fuel}・${AREA_BY_ID[p.area].name}エリア${p.approx ? '｜<span class="u-derate">位置は概算</span>' : ''}</div>
       <div class="tip-kpi">
-        <div><span>定格合計</span><b>${Math.round(totalCap).toLocaleString()} MW</b></div>
+        <div><span>認可出力合計</span><b>${Math.round(totalCap).toLocaleString()} MW</b></div>
         <div><span>供給可能量(現在)</span><b>${Math.round(curAv).toLocaleString()} MW</b></div>
         <div><span>発電実績(現在)</span><b>${Math.round(curGen).toLocaleString()} MW</b></div>
       </div>
       <div class="tip-units">${unitRows}</div>
-      <div class="tip-foot">クリックで詳細・実績グラフ</div>
+      <div class="tip-foot">実績: ${genNote}｜クリックで詳細</div>
     </div>`;
 }
 
-// エリア集約マーカー＋連系線
 function buildAreaAggregation() {
-  // エリアごとの現在発電量・供給可能量を集計
   const agg = {};
   for (const a of AREAS) agg[a.id] = { gen: 0, av: 0 };
-  for (const x of ALL_UNITS) {
-    agg[x.plant.area].gen += unitOutput(x.uid, NOW);
+  for (const x of VISIBLE_UNITS) {   // 軸別サブユニットは除外（二重計上防止）
+    const o = unitOutput(x.uid, NOW);
+    if (o !== null) agg[x.plant.area].gen += o;   // 非公開・廃止は実績に計上しない
     agg[x.plant.area].av += unitAvailability(x.uid, NOW).capMW;
   }
 
-  // 連系線
   for (const ln of LINES) {
     const a = AREA_BY_ID[ln.from], b = AREA_BY_ID[ln.to];
     const util = Math.abs(ln.flowMW) / ln.capMW;
@@ -126,7 +157,7 @@ function buildAreaAggregation() {
     const dir = ln.flowMW >= 0 ? `${a.name}→${b.name}` : `${b.name}→${a.name}`;
     poly.bindTooltip(`
       <div class="tip">
-        <div class="tip-head"><b>${ln.name}</b></div>
+        <div class="tip-head"><b>${ln.name}</b>（サンプル値）</div>
         <div class="tip-kpi">
           <div><span>運用容量</span><b>${ln.capMW.toLocaleString()} MW</b></div>
           <div><span>潮流</span><b>${Math.abs(ln.flowMW).toLocaleString()} MW</b></div>
@@ -137,7 +168,6 @@ function buildAreaAggregation() {
     poly.addTo(linesLayer);
   }
 
-  // エリア集約マーカー
   for (const a of AREAS) {
     const g = agg[a.id];
     const r = 12 + Math.sqrt(g.gen) * 0.28;
@@ -147,21 +177,20 @@ function buildAreaAggregation() {
     cm.bindTooltip(`${a.name}<br><b>${Math.round(g.gen).toLocaleString()}</b> MW`, {
       permanent: true, direction: 'center', className: 'area-label',
     });
-    cm.on('mouseover', () => cm.bindPopup(areaPopupHtml(a, g)));
+    cm.on('mouseover', () => cm.bindPopup(areaPopupHtml(a, g)).openPopup());
     cm.on('click', () => map.flyTo([a.lat, a.lon], 8));
     cm.addTo(areaLayer);
   }
 }
 
 function areaPopupHtml(a, g) {
-  const cnt = PLANTS.filter((p) => p.area === a.id).length;
+  const cnt = PLANTS.filter((p) => p.area === a.id && visiblePlantUnits(p).length > 0).length;
   return `<b>${a.name}エリア</b><br>発電所 ${cnt} 箇所<br>
     発電実績(現在) ${Math.round(g.gen).toLocaleString()} MW<br>
     供給可能量(現在) ${Math.round(g.av).toLocaleString()} MW<br>
     <small>クリックでエリアにズーム</small>`;
 }
 
-// ズームに応じて表示レイヤを切替
 function updateLayersForZoom() {
   const z = map.getZoom();
   if (z >= ZOOM_THRESHOLD) {
@@ -196,7 +225,7 @@ function renderLegend() {
   document.getElementById('legend').innerHTML = `
     <div class="legend-title">燃料種別</div>
     <div class="legend-row">${fuels}</div>
-    <div class="legend-title">ステータス（HJKS）</div>
+    <div class="legend-title">ステータス（HJKS実データ）</div>
     <div class="legend-row">
       <span class="lg"><i class="ring" style="box-shadow:0 0 0 2px #e53935 inset"></i>停止</span>
       <span class="lg"><i class="ring" style="box-shadow:0 0 0 2px #f9a825 inset"></i>出力低下</span>
@@ -220,14 +249,13 @@ function buildPanelControls() {
   ['p-from', 'p-to', 'p-gran'].forEach((id) =>
     document.getElementById(id).addEventListener('change', onChange));
 
-  // プリセット
   document.querySelectorAll('[data-preset]').forEach((btn) => {
     btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
   });
 }
 
 function applyPreset(key) {
-  const end = new Date('2026-06-13');
+  const end = new Date(NOW);
   const start = new Date(end);
   let gran = 'hour';
   if (key === '24h') { start.setDate(end.getDate() - 1); gran = 'hour'; }
@@ -248,29 +276,33 @@ function selectPlant(plantId) {
   state.selectedPlantId = plantId;
   state.selectedUnitUid = 'ALL';
   const p = PLANT_BY_ID[plantId];
+  if (!p) return;
 
-  // ハイライト
   highlightPlant(plantId);
   if (map.getZoom() < ZOOM_THRESHOLD) map.flyTo([p.lat, p.lon], 8);
 
-  // 号機セレクタ
   const sel = document.getElementById('unit-select');
-  sel.innerHTML = `<option value="ALL">発電所全体（全${p.units.length}号機）</option>` +
-    p.units.map((u) => `<option value="${p.id}/${u.name}">${u.name}（${u.capMW.toLocaleString()} MW）</option>`).join('');
+  const units = visiblePlantUnits(p);   // 軸別サブユニットは選択肢から隠す
+  sel.innerHTML = `<option value="ALL">発電所全体（全${units.length}ユニット）</option>` +
+    units.map((u) => {
+      const b = unitBadge(u.uid);
+      const tag = b ? ` [${b}]` : '';
+      return `<option value="${u.uid}">${esc(u.name)}（${u.capMW.toLocaleString()} MW）${tag}</option>`;
+    }).join('');
   sel.onchange = () => { state.selectedUnitUid = sel.value; refreshPlantChart(); };
 
   document.getElementById('sel-empty').style.display = 'none';
   document.getElementById('sel-body').style.display = 'block';
   document.getElementById('sel-title').textContent = p.name;
-  document.getElementById('sel-meta').textContent = `${p.op}・${p.fuel}・${p.area}エリア`;
+  document.getElementById('sel-meta').textContent =
+    `${p.op}・${p.fuel}・${AREA_BY_ID[p.area].name}エリア` + (p.approx ? '（位置は概算）' : '');
 
   refreshPlantChart();
 }
 
 function highlightPlant(plantId) {
   for (const [id, m] of Object.entries(plantMarkers)) {
-    const st = currentStatusOfPlant(PLANT_BY_ID[id]);
-    const base = STATUS_STYLE[st.status];
+    const base = STATUS_STYLE[plantStatusCache[id].status];
     if (id === plantId) m.setStyle({ color: '#0d47a1', weight: 4 });
     else m.setStyle({ color: base.ring, weight: base.weight });
   }
@@ -280,30 +312,42 @@ function refreshPlantChart() {
   const p = PLANT_BY_ID[state.selectedPlantId];
   if (!p) return;
   const uids = state.selectedUnitUid === 'ALL'
-    ? p.units.map((u) => `${p.id}/${u.name}`)
+    ? visiblePlantUnits(p).map((u) => u.uid)
     : [state.selectedUnitUid];
 
+  const noDataCount = uids.filter((uid) => !hasOcctoData(uid)).length;
+  const actualLabel = noDataCount === 0 ? '発電実績'
+    : noDataCount === uids.length ? '発電実績(実データなし)'
+    : '発電実績(実データのみ)';
+
   const s = buildSeries(uids, state.period.from, state.period.to, state.period.gran);
-  plantChart = drawChart('chart-plant', plantChart, s, '発電実績', '供給可能量');
-  document.getElementById('sel-kpi').innerHTML = kpiHtml(s);
+  plantChart = drawChart('chart-plant', plantChart, s, actualLabel, '供給可能量(HJKS)');
+  document.getElementById('sel-kpi').innerHTML = kpiHtml(s, noDataCount, uids.length);
 }
 
 /* ----------------------------------------------------------------------------
  * グループ集計
  * ------------------------------------------------------------------------- */
 function buildGroupSelect() {
-  const ops = [...new Set(PLANTS.map((p) => p.op))];
-  const fuels = [...new Set(PLANTS.map((p) => p.fuel))];
+  // 事業者は数が多いので合計容量の上位30社のみ掲載
+  const capByOp = {};
+  for (const p of PLANTS) {
+    const cap = visiblePlantUnits(p).reduce((s, u) => s + u.capMW, 0);
+    capByOp[p.op] = (capByOp[p.op] || 0) + cap;
+  }
+  const topOps = Object.entries(capByOp)
+    .sort((a, b) => b[1] - a[1]).slice(0, 30).map(([op]) => op);
 
-  const opOpts = ops.map((o) => `<option value="op:${o}">${o}</option>`).join('');
+  const fuels = [...new Set(PLANTS.map((p) => p.fuel))];
+  const opOpts = topOps.map((o) => `<option value="op:${esc(o)}">${esc(o)}</option>`).join('');
   const fuelOpts = fuels.map((f) => `<option value="fuel:${f}">${f}</option>`).join('');
   const customOpts = GROUPS.map((g) => `<option value="grp:${g.id}">${g.name}</option>`).join('');
 
   document.getElementById('group-select').innerHTML =
     `<option value="">— 選択してください —</option>` +
-    `<optgroup label="事業者">${opOpts}</optgroup>` +
+    `<optgroup label="カスタムグループ（マスタ）">${customOpts}</optgroup>` +
     `<optgroup label="燃料種別">${fuelOpts}</optgroup>` +
-    `<optgroup label="カスタムグループ（マスタ）">${customOpts}</optgroup>`;
+    `<optgroup label="事業者（容量上位30）">${opOpts}</optgroup>`;
 
   document.getElementById('group-select').addEventListener('change', (e) => {
     state.selectedGroupId = e.target.value || null;
@@ -311,15 +355,16 @@ function buildGroupSelect() {
   });
 }
 
-// グループID→対象ユニット uid 配列
 function groupUids(groupId) {
   if (!groupId) return [];
-  const [type, key] = groupId.split(':');
-  if (type === 'op') return ALL_UNITS.filter((x) => x.plant.op === key).map((x) => x.uid);
-  if (type === 'fuel') return ALL_UNITS.filter((x) => x.plant.fuel === key).map((x) => x.uid);
+  const sep = groupId.indexOf(':');
+  const type = groupId.slice(0, sep), key = groupId.slice(sep + 1);
+  // 軸別サブユニットは集計対象から除外（系列側に集約済み・二重計上防止）
+  if (type === 'op') return VISIBLE_UNITS.filter((x) => x.plant.op === key).map((x) => x.uid);
+  if (type === 'fuel') return VISIBLE_UNITS.filter((x) => x.plant.fuel === key).map((x) => x.uid);
   if (type === 'grp') {
     const g = GROUPS.find((gg) => gg.id === key);
-    return ALL_UNITS.filter((x) => g.test(x.plant, x.unit)).map((x) => x.uid);
+    return g ? VISIBLE_UNITS.filter((x) => g.test(x.plant)).map((x) => x.uid) : [];
   }
   return [];
 }
@@ -330,13 +375,19 @@ function refreshGroupChart() {
   if (!gid) { body.style.display = 'none'; clearGroupHighlight(); return; }
 
   const uids = groupUids(gid);
+  const noDataCount = uids.filter((uid) => !hasOcctoData(uid)).length;
+  const actualLabel = noDataCount === 0 ? '発電実績(合算)'
+    : noDataCount === uids.length ? '発電実績(合算・実データなし)'
+    : '発電実績(合算・実データのみ)';
+
   const s = buildSeries(uids, state.period.from, state.period.to, state.period.gran);
-  groupChart = drawChart('chart-group', groupChart, s, '発電実績（合算）', '供給可能量（合算）');
+  groupChart = drawChart('chart-group', groupChart, s, actualLabel, '供給可能量(合算)');
 
   body.style.display = 'block';
   const plantIds = [...new Set(uids.map((u) => u.split('/')[0]))];
   document.getElementById('grp-kpi').innerHTML =
-    `<div class="grp-count">対象: ${plantIds.length} 発電所 / ${uids.length} 号機</div>` + kpiHtml(s);
+    `<div class="grp-count">対象: ${plantIds.length} 発電所 / ${uids.length} ユニット</div>`
+    + kpiHtml(s, noDataCount, uids.length);
 
   highlightGroupPlants(plantIds);
 }
@@ -351,38 +402,44 @@ function highlightGroupPlants(plantIds) {
 function clearGroupHighlight() {
   for (const [id, m] of Object.entries(plantMarkers)) {
     if (id === state.selectedPlantId) continue;
-    const st = currentStatusOfPlant(PLANT_BY_ID[id]);
-    m.setStyle(STATUS_STYLE[st.status] ? { color: STATUS_STYLE[st.status].ring, weight: STATUS_STYLE[st.status].weight } : {});
+    const base = STATUS_STYLE[plantStatusCache[id].status];
+    m.setStyle({ color: base.ring, weight: base.weight });
   }
 }
 
 /* ----------------------------------------------------------------------------
- * HJKS 現在の停止・出力低下リスト
+ * HJKS 現在の停止・出力低下リスト（実データ）
  * ------------------------------------------------------------------------- */
 function renderHjksList() {
-  const active = OUTAGES.filter((o) => {
-    const from = new Date(o.from + 'T00:00:00');
-    const to = new Date(o.to + 'T23:59:59');
-    return NOW >= from && NOW <= to;
-  });
-  active.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === '停止' ? -1 : 1));
+  const active = collectActiveEvents();
+  // 停止を先、同種なら認可出力の大きい順
+  active.sort((a, b) =>
+    (a.ev.k - b.ev.k) || (b.unit.capMW - a.unit.capMW));
 
-  const html = active.map((o) => {
-    const [pid, uname] = o.unit.split('/');
-    const p = PLANT_BY_ID[pid];
-    const cls = o.kind === '停止' ? 'b-stop' : 'b-derate';
-    const cap = o.kind === '出力低下' ? `→ ${o.toCap.toLocaleString()} MW に抑制` : '全停';
-    return `<div class="hjks-row" data-plant="${pid}">
-        <div class="hjks-h"><span class="tip-badge ${cls}">${o.kind}</span>
-          <b>${p.name}</b> ${uname}</div>
-        <div class="hjks-d">${o.reason}｜${cap}</div>
-        <div class="hjks-p">${o.from} 〜 ${o.to}</div>
+  const total = active.length;
+  const shown = active.slice(0, HJKS_LIST_MAX);
+
+  const html = shown.map((x) => {
+    const isStop = x.ev.k === 0;
+    const cls = isStop ? 'b-stop' : 'b-derate';
+    const kind = isStop ? '停止' : '出力低下';
+    const cap = isStop ? '全停'
+      : `→ ${x.ev.cap.toLocaleString()} MW に低下`;
+    const reason = x.ev.note ? `｜${esc(x.ev.note)}` : '';
+    return `<div class="hjks-row" data-plant="${x.plant.id}">
+        <div class="hjks-h"><span class="tip-badge ${cls}">${kind}</span>
+          <b>${esc(x.plant.name)}</b> ${esc(x.unit.name)}
+          <span class="muted">(${x.unit.capMW.toLocaleString()} MW)</span></div>
+        <div class="hjks-d">${esc(x.ev.a)}${reason}｜${cap}</div>
+        <div class="hjks-p">${fmtMs(x.ev.f)} 〜 ${fmtMs(x.ev.t)}</div>
       </div>`;
   }).join('');
 
+  const more = total > HJKS_LIST_MAX
+    ? `<div class="muted" style="padding:4px">… 他 ${total - HJKS_LIST_MAX} 件（地図のリング表示参照）</div>` : '';
   const box = document.getElementById('hjks-list');
-  box.innerHTML = html || '<div class="muted">現在、停止・出力低下の登録はありません</div>';
-  document.getElementById('hjks-count').textContent = active.length;
+  box.innerHTML = (html || '<div class="muted">現在、停止・出力低下の登録はありません</div>') + more;
+  document.getElementById('hjks-count').textContent = total;
   box.querySelectorAll('.hjks-row').forEach((row) =>
     row.addEventListener('click', () => selectPlant(row.dataset.plant)));
 }
@@ -422,15 +479,18 @@ function drawChart(canvasId, instance, s, labelActual, labelAvail) {
   });
 }
 
-function kpiHtml(s) {
-  const avgA = avg(s.actual), avgAv = avg(s.available);
-  const peakA = Math.max(...s.actual, 0);
+function kpiHtml(s, noDataCount = 0, total = 0) {
+  const actualVals = s.actual.filter((v) => v !== null);   // 実データ無しの null を除外
+  const avgA = avg(actualVals), avgAv = avg(s.available);
+  const peakA = Math.max(...actualVals, 0);
   const util = avgAv > 0 ? (avgA / avgAv) * 100 : 0;
+  const note = (noDataCount > 0 && total > 0)
+    ? ` <span class="u-private">(${noDataCount}/${total}ユニット実データ無)</span>` : '';
   return `<div class="kpi3">
-      <div><span>平均 発電実績</span><b>${Math.round(avgA).toLocaleString()} MW</b></div>
+      <div><span>平均 発電実績${note}</span><b>${Math.round(avgA).toLocaleString()} MW</b></div>
       <div><span>平均 供給可能量</span><b>${Math.round(avgAv).toLocaleString()} MW</b></div>
       <div><span>ピーク実績</span><b>${Math.round(peakA).toLocaleString()} MW</b></div>
-      <div><span>設備利用率(対供給可能量)</span><b>${Math.round(util)}%</b></div>
+      <div><span>利用率(対供給可能量)</span><b>${Math.round(util)}%</b></div>
     </div>`;
 }
 
@@ -442,4 +502,7 @@ function refreshCharts() { refreshPlantChart(); refreshGroupChart(); }
 function avg(arr) { return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0; }
 function toInputDate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

@@ -1,0 +1,24 @@
+# ============================================================================
+# OCCTO / HJKS の実データは現状公開不可のため除外（ローカルで取得・生成する）
+#   取得:   uv run fetch_hjks.py / fetch_occto.py  → data/ に CSV
+#   生成:   uv run build_data.py / build_occto.py  → hjks_data.js / occto_data.js
+#
+# 公開するもの: ソースコード一式 と master/（廃止リスト等の手動管理メタデータ）
+# ============================================================================
+
+# OCCTO/HJKS 生データ・中間ファイル（CSV, parquet, レポート等）
+/data/
+
+# 実データを含む生成物（ブラウザ読み込み用 JS）
+/hjks_data.js
+/occto_data.js
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+*.swp

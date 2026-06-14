@@ -99,6 +99,8 @@ select.full { width: 100%; font-size: 12px; padding: 5px 6px; border: 1px solid 
 .tip-unit { display: flex; justify-content: space-between; font-size: 11px; }
 .u-stop { color: #e53935; font-weight: 700; }
 .u-derate { color: #c47f00; font-weight: 700; }
+.u-private { color: #757575; font-weight: 700; }
+.u-review { color: #e67e00; font-weight: 700; }
 .tip-foot { margin-top: 5px; font-size: 10px; color: #98a3af; }
 .area-label { background: transparent; border: 0; box-shadow: none; color: #0d2440; font-weight: 700; text-align: center; }
 .area-label::before { display: none; }
