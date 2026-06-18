@@ -61,6 +61,11 @@ function buildMap() {
   buildAreaAggregation();
 
   map.on('zoomend', () => { updateLayersForZoom(); updateModeBadge(); });
+
+  // 初期レイアウト確定後・画面回転時にサイズを再計算（スマホで地図が出ない対策）
+  setTimeout(() => map.invalidateSize(), 200);
+  window.addEventListener('orientationchange',
+    () => setTimeout(() => map.invalidateSize(), 300));
 }
 
 function buildPlantMarkers() {
